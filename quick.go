@@ -256,6 +256,7 @@ func Check(function interface{}, config *Config) (err error) {
 		}
 
 		if !f.Call(arguments)[0].Bool() {
+			shrink(f, arguments)
 			err = &CheckError{i + 1, toInterfaces(arguments)}
 			return
 		}
