@@ -193,9 +193,13 @@ func (s SetupError) Error() string { return string(s) }
 type CheckError struct {
 	Count int
 	In    []interface{}
+	Shrunken []interface{}
 }
 
 func (s *CheckError) Error() string {
+	if len(s.Shrunken) == len(s.In) {
+		return fmt.Sprintf("#%d: failed on input %s => %s", s.Count, toString(s.In), toString(s.Shrunken))
+	}
 	return fmt.Sprintf("#%d: failed on input %s", s.Count, toString(s.In))
 }
 
@@ -256,8 +260,11 @@ func Check(function interface{}, config *Config) (err error) {
 		}
 
 		if !f.Call(arguments)[0].Bool() {
-			shrink(f, arguments)
-			err = &CheckError{i + 1, toInterfaces(arguments)}
+			pred := func(args []reflect.Value) bool {
+				return f.Call(args)[0].Bool()
+			}
+			shrunken := shrinkArguments(pred, arguments)
+			err = &CheckError{i + 1, toInterfaces(arguments), toInterfaces(shrunken)}
 			return
 		}
 	}
@@ -304,7 +311,13 @@ func CheckEqual(f, g interface{}, config *Config) (err error) {
 		yOut := toInterfaces(y.Call(arguments))
 
 		if !reflect.DeepEqual(xOut, yOut) {
-			err = &CheckEqualError{CheckError{i + 1, toInterfaces(arguments)}, xOut, yOut}
+			pred := func(args []reflect.Value) bool {
+				xOut := toInterfaces(x.Call(args))
+				yOut := toInterfaces(y.Call(args))
+				return reflect.DeepEqual(xOut, yOut)
+			}
+			shrunken := shrinkArguments(pred, arguments)
+			err = &CheckEqualError{CheckError{i + 1, toInterfaces(arguments), toInterfaces(shrunken)}, xOut, yOut}
 			return
 		}
 	}

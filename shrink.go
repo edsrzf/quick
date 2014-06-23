@@ -2,92 +2,162 @@ package quick
 
 import (
 	"reflect"
+	"unicode"
+	"unicode/utf8"
 )
 
+// A Shrinker can produce simpler values with its same type.
 type Shrinker interface {
-	Shrink(in <-chan reflect.Value, out chan<- reflect.Value)
+	// Shrink sends simpler values of its type to out. Shrink must stop
+	// sending when it receives a value on stop. To avoid possible deadlocks,
+	// all sends must be done in a select
+	Shrink(out chan<- reflect.Value, stop <-chan bool)
 }
 
-func shrinkArguments(f reflect.Value, arguments []reflect.Value) {
-	args2 := append([]reflect.Value(nil), arguments...)
+// TryShrink is a convenience method for implementing Shrinker's Shrink method.
+// It sends vals one-by-one to out until it has sent them all or received a value
+// on stop.
+// It returns true when a value was received on stop and the Shrinker should stop
+// sending values.
+func TryShrink(out chan<- reflect.Value, stop <-chan bool, vals ...interface{}) bool {
+	for _, val := range vals {
+		select {
+		case out <- reflect.ValueOf(val):
+		case <- stop:
+			return true
+		}
+	}
+	return false
+}
+
+func shrinkArguments(f func([]reflect.Value) bool, arguments []reflect.Value) []reflect.Value {
+	newArgs := append([]reflect.Value(nil), arguments...)
 	for i, arg := range arguments {
-		possibilities := shrink(arg)
+		pred := func(v reflect.Value) bool {
+			newArgs[i] = v
+			return f(newArgs)
+		}
+		newArgs[i] = shrink(pred, arg)
 	}
+	return newArgs
 }
 
-func shrinkInt(val reflect.Value, in <-chan reflect.Value, out chan<- reflect.Value) {
-	out <- reflect.ValueOf(0).Convert(val.Type())
-}
-
-func shrinkUint(val reflect.Value, in <-chan reflect.Value, out chan<- reflect.Value) {
-	v := val.Uint()
-	typ := val.Type()
-	out <- reflect.ValueOf(0).Convert(typ)
+func shrinkInt(val reflect.Value, out chan<- reflect.Value, stop <-chan bool) {
+	v := val.Int()
+	if v == 0 {
+		return
+	}
 	i := v / 2
-	for {
-		if i == 0 {
-			return
-		}
-		nextVal := reflect.ValueOf(v - i).Convert(typ)
+	var done bool
+	if v > 0 {
+		done = TryShrink(out, stop, 0, v - i)
+	} else {
+		done = TryShrink(out, stop, 0, -v, v - i)
+	}
+	if done {
+		return
+	}
+	for i != 0 {
 		i /= 2
-		select {
-		case val = <-in:
-			v = val.Uint()
-			i = v / 2
-		case out <- nextVal:
+		if TryShrink(out, stop, v - i) {
+			return
 		}
 	}
 }
 
-func shrinkString(val reflect.Value, in <-chan reflect.Value, out chan<- reflect.Value) {
-	s := val.String()
-	typ := val.Type()
-	out <- reflect.ValueOf("").Convert(typ)
-	i := len(s) / 2
-	for {
-		if i == len(s) {
+func shrinkUint(val reflect.Value, out chan<- reflect.Value, stop <-chan bool) {
+	v := val.Int()
+	if v == 0 {
+		return
+	}
+	i := v / 2
+	if TryShrink(out, stop, 0, v - i) {
+		return
+	}
+	for i != 0 {
+		i /= 2
+		if TryShrink(out, stop, v - i) {
 			return
 		}
-		nextVal := reflect.ValueOf(s[:i]).Convert(typ)
+	}
+}
+
+func shrinkString(val reflect.Value, out chan<- reflect.Value, stop <-chan bool) {
+	s := val.String()
+	if TryShrink(out, stop, "") {
+		return
+	}
+	// easier to work with runes
+	runes := []rune(s)
+	i := len(runes) / 2
+	// first try to shrink the size
+	for i > 0 {
+		if TryShrink(out, stop, string(runes[i:]), string(runes[:i])) {
+			return
+		}
 		i /= 2
-		select {
-		case val = <-in:
-			v = val.String()
-			if v == "" {
+	}
+	// now convert to runes and shrink each individual rune
+	newrunes := make([]rune, len(runes))
+	for i, r := range runes {
+		copy(newrunes, runes)
+		if r >= utf8.RuneSelf {
+			newrunes[i] = 'à'
+			if TryShrink(out, stop, string(newrunes)) {
 				return
 			}
-			i = len(s) / 2
-		case out <- nextVal:
+		}
+		newrunes[i] = 'a'
+		if TryShrink(out, stop, string(newrunes)) {
+			return
+		}
+		if lower := unicode.ToLower(r); lower != r {
+			newrunes[i] = lower
+			if TryShrink(out, stop, string(newrunes)) {
+				return
+			}
 		}
 	}
 }
 
-func shrink(pred func(reflect.Value) bool, val reflect.Value) {
-	in := make(chan reflect.Value)
-	out := make(chan reflect.Value)
-	defer close(out)
-
-	go func() {
-		if shrinker, ok := val.Interface().(Shrinker); ok {
-			shrinker.Shrink(in, out)
-			return
-		}
-		switch val.Kind() {
-		case reflect.Bool:
-			if val.Bool() {
-				out <- reflect.ValueOf(false).Convert(val.Type())
-			}
-			return
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			return shrinkInt(val)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16,
-			reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			return shrinkUint(val)
-		}
-	}()
-
+func shrink(pred func(reflect.Value) bool, val reflect.Value) reflect.Value {
 	for {
-		select {
+		if newVal := shrinkStep(pred, val); newVal.IsValid() && !reflect.DeepEqual(val.Interface(), newVal.Interface()) {
+			val = newVal
+		} else {
+			return val
 		}
 	}
+}
+
+func shrinkStep(pred func(reflect.Value) bool, val reflect.Value) reflect.Value {
+	out := make(chan reflect.Value)
+	stop := make(chan bool, 1) // buffer size 1 in case we send after the last item
+	go func() {
+		defer close(out)
+		iface := val.Interface()
+		if shrinker, ok := iface.(Shrinker); ok {
+			shrinker.Shrink(out, stop)
+			return
+		}
+		switch v := iface.(type) {
+		case bool:
+			if v {
+				out <- reflect.ValueOf(false)
+			}
+		case int, int8, int16, int32, int64:
+			shrinkInt(val, out, stop)
+		case uint, uint8, uint16, uint32, uint64, uintptr:
+			shrinkUint(val, out, stop)
+		case string:
+			shrinkString(val, out, stop)
+		}
+	}()
+	for v := range out {
+		if !pred(v) {
+			stop <- true
+			return v
+		}
+	}
+	return reflect.Value{}
 }
